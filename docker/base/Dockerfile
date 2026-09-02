@@ -7,6 +7,9 @@ ARG PASEO_VERSION
 
 ENV ONNXRUNTIME_NODE_INSTALL=skip
 
+RUN npm config set registry https://registry.npmmirror.com
+RUN sed -i "s/deb.debian.org/mirrors.aliyun.com/g" /etc/apt/sources.list.d/debian.sources
+
 WORKDIR /tmp/paseo-src
 COPY . .
 
@@ -28,6 +31,9 @@ RUN set -eux; \
     npm pack --workspace=@getpaseo/cli --pack-destination /tmp/paseo-packs
 
 FROM ${NODE_IMAGE}
+
+RUN npm config set registry https://registry.npmmirror.com
+RUN sed -i "s/deb.debian.org/mirrors.aliyun.com/g" /etc/apt/sources.list.d/debian.sources
 
 ENV HOME=/home/paseo \
     PASEO_HOME=/home/paseo/.paseo \
