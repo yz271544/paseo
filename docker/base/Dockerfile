@@ -60,7 +60,9 @@ RUN set -eux; \
       lbzip2 \
       openssh-client \
       procps \
-      tini; \
+      tini \
+      bubblewrap \
+      netcat-openbsd; \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=source-pack /tmp/paseo-packs /tmp/paseo-packs
