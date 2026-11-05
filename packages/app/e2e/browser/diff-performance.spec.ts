@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { CDPSession, Locator, Page, TestInfo } from "@playwright/test";
+import { pullRequestCorpus } from "../../src/git/diff-document/benchmark-corpus";
 import { buildHostWorkspaceRoute } from "../../src/utils/host-routes";
 import { test, expect } from "../support/fixtures";
 import { getServerId } from "../support/helpers/server-id";
@@ -93,7 +94,10 @@ diffPerfDescribe("Diff canvas performance", () => {
             [
               root.querySelectorAll('[data-diff-header="true"]').length,
               root.querySelectorAll("*").length,
-              root.querySelector('[data-testid="git-diff-header-canvas"]') ? "canvas" : "dom",
+              root.querySelector('[data-testid="git-diff-canvas"]') &&
+              root.querySelectorAll('[data-testid^="git-diff-sticky-header-"]').length === 2
+                ? "canvas-pool"
+                : "dom",
             ] as const,
         );
       const headerDomMetrics = await page.getByTestId("diff-file-0-toggle").evaluate((header) => {
@@ -125,7 +129,7 @@ diffPerfDescribe("Diff canvas performance", () => {
         };
       });
       const headerCanvasMetrics = await page
-        .getByTestId("git-diff-header-canvas")
+        .getByTestId("git-diff-sticky-header-0")
         .evaluate((canvas: HTMLCanvasElement) => {
           const context = canvas.getContext("2d");
           if (!context) throw new Error("Header canvas has no 2D context");
@@ -168,6 +172,7 @@ diffPerfDescribe("Diff canvas performance", () => {
       );
       if (!RUN_HEADER_COMPARISON) {
         expect(benchmark.maximumShells).toBeLessThan(120);
+        expect(benchmark.maximumStickyCanvases).toBe(2);
         expect(benchmark.blankHeaderFrames).toBe(0);
         expect(benchmark.medianFrameMs).toBeLessThanOrEqual(MANY_FILE_MAX_MEDIAN_FRAME_MS);
         expect(benchmark.p95FrameMs).toBeLessThanOrEqual(MANY_FILE_MAX_P95_FRAME_MS);
@@ -292,7 +297,186 @@ diffPerfDescribe("Diff canvas performance", () => {
       await repo.cleanup().catch(() => undefined);
     }
   });
+  test("toggling line wrap on a pull-request-sized diff", async ({ page }, testInfo) => {
+    test.setTimeout(300_000);
+    const corpus = await createPullRequestCorpusRepository();
+    const client = await connectSeedClient();
+
+    try {
+      const created = await client.createWorkspace({
+        source: { kind: "directory", path: corpus.repo.path },
+      });
+      if (!created.workspace) {
+        throw new Error(created.error ?? "Failed to create wrap performance workspace");
+      }
+
+      await configureUnwrappedUnifiedDiff(page);
+      await instrumentDiffLatency(page);
+      await page.setViewportSize({ width: 1400, height: 900 });
+      await page.goto(buildHostWorkspaceRoute(getServerId(), created.workspace.id));
+      await waitForWorkspaceTabsVisible(page);
+      const openStartedAt = performance.now();
+      await openChangesPanel(page, 90_000);
+      await expect(page.getByTestId("git-diff-canvas")).toBeVisible({ timeout: 30_000 });
+      const open = {
+        readyMs: Math.round(performance.now() - openStartedAt),
+        ...(await readDiffDocumentRenders(page)),
+      };
+
+      const toggles: WrapToggleMeasurement[] = [];
+      for (const name of [
+        "wrap on (cold)",
+        "wrap off (cold)",
+        "wrap on (warm)",
+        "wrap off (warm)",
+      ]) {
+        toggles.push(await measureWrapToggle(page, name));
+      }
+      const unwrappedScroll = await continuouslyScrollCanvas(page);
+      toggles.push(await measureWrapToggle(page, "wrap on (warm, scrolled)"));
+      const wrappedScroll = await continuouslyScrollCanvas(page);
+
+      const report = {
+        scenario: "wrap-toggle",
+        sourceFiles: corpus.fileCount,
+        sourceLines: corpus.lineCount,
+        open,
+        toggles,
+        scroll: {
+          unwrapped: summarizeScroll(unwrappedScroll),
+          wrapped: summarizeScroll(wrappedScroll),
+        },
+      };
+      await attachPerformanceReport(testInfo, report);
+      console.log(`[perf] Wrap toggle: ${JSON.stringify(report)}`);
+
+      const [wrapOn, wrapOff] = toggles;
+      expect(wrapOn!.scrollHeightAfter).toBeGreaterThan(wrapOn!.scrollHeightBefore);
+      expect(wrapOff!.scrollHeightAfter).toBe(wrapOn!.scrollHeightBefore);
+    } finally {
+      await client.close().catch(() => undefined);
+      await corpus.repo.cleanup().catch(() => undefined);
+    }
+  });
 });
+
+interface WrapToggleMeasurement {
+  name: string;
+  /** Pointer down on the toolbar button to two painted frames after the document resized. */
+  latencyMs: number;
+  scrollHeightBefore: number;
+  scrollHeightAfter: number;
+  longestTaskMs: number;
+  longTaskTotalMs: number;
+  diffDocumentCommits: number;
+  diffDocumentRenderMs: number;
+}
+
+interface LongTask {
+  startTime: number;
+  duration: number;
+}
+
+interface DiffLatencyScope {
+  __PASEO_RENDER_PROFILE_ENABLED__?: boolean;
+  __PASEO_RENDER_PROFILE__?: Array<{ id: string; actualDuration: number }>;
+  __PASEO_RESET_RENDER_PROFILE__?: () => void;
+  __PASEO_LONG_TASKS__?: LongTask[];
+  __PASEO_WRAP_TOGGLE_AT__?: number;
+}
+
+async function createPullRequestCorpusRepository() {
+  const files = pullRequestCorpus();
+  const repo = await createTempGitRepo("diff-wrap-perf-", {
+    files: files.map((file) => ({ path: file.path, content: "baseline\n" })),
+  });
+  for (const file of files) {
+    await writeFile(path.join(repo.path, file.path), `${file.lines.join("\n")}\n`);
+  }
+  return {
+    repo,
+    fileCount: files.length,
+    lineCount: files.reduce((count, file) => count + file.lines.length, 0),
+  };
+}
+
+async function instrumentDiffLatency(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const scope = globalThis as typeof globalThis & DiffLatencyScope;
+    scope.__PASEO_RENDER_PROFILE_ENABLED__ = true;
+    scope.__PASEO_LONG_TASKS__ = [];
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        scope.__PASEO_LONG_TASKS__?.push({ startTime: entry.startTime, duration: entry.duration });
+      }
+    }).observe({ type: "longtask", buffered: true });
+  });
+}
+
+async function readDiffDocumentRenders(
+  page: Page,
+): Promise<{ diffDocumentCommits: number; diffDocumentRenderMs: number }> {
+  return page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & DiffLatencyScope;
+    const samples = (scope.__PASEO_RENDER_PROFILE__ ?? []).filter(
+      (sample) => sample.id === "DiffDocument",
+    );
+    return {
+      diffDocumentCommits: samples.length,
+      diffDocumentRenderMs: Math.round(
+        samples.reduce((total, sample) => total + sample.actualDuration, 0),
+      ),
+    };
+  });
+}
+
+async function measureWrapToggle(page: Page, name: string): Promise<WrapToggleMeasurement> {
+  const scroll = page.getByTestId("git-diff-scroll");
+  const scrollHeightBefore = await scroll.evaluate((element) => element.scrollHeight);
+  await page.evaluate(() => {
+    const scope = globalThis as typeof globalThis & DiffLatencyScope;
+    scope.__PASEO_RESET_RENDER_PROFILE__?.();
+    scope.__PASEO_LONG_TASKS__ = [];
+    scope.__PASEO_WRAP_TOGGLE_AT__ = undefined;
+    document.addEventListener(
+      "pointerdown",
+      () => {
+        scope.__PASEO_WRAP_TOGGLE_AT__ = performance.now();
+      },
+      { capture: true, once: true },
+    );
+  });
+  await page.getByTestId("changes-toggle-wrap-lines").click();
+  const measured = await scroll.evaluate(async (element, before) => {
+    const scope = globalThis as typeof globalThis & DiffLatencyScope;
+    const deadline = performance.now() + 240_000;
+    while (element.scrollHeight === before && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    const doneAt = performance.now();
+    // Long task entries are delivered after the task ends; give the observer a turn.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const startedAt = scope.__PASEO_WRAP_TOGGLE_AT__ ?? doneAt;
+    const longTasks = (scope.__PASEO_LONG_TASKS__ ?? []).filter(
+      (task) => task.startTime + task.duration >= startedAt && task.startTime <= doneAt,
+    );
+    return {
+      latencyMs: Math.round(doneAt - startedAt),
+      scrollHeightAfter: element.scrollHeight,
+      longestTaskMs: Math.round(Math.max(0, ...longTasks.map((task) => task.duration))),
+      longTaskTotalMs: Math.round(longTasks.reduce((total, task) => total + task.duration, 0)),
+    };
+  }, scrollHeightBefore);
+  return { name, scrollHeightBefore, ...measured, ...(await readDiffDocumentRenders(page)) };
+}
+
+function summarizeScroll(report: Awaited<ReturnType<typeof continuouslyScrollCanvas>>) {
+  const { frameSignatures: _frameSignatures, ...summary } = report;
+  return summary;
+}
 
 async function measureAdditionalPerformanceScenario(
   page: Page,
@@ -435,7 +619,8 @@ async function openFirstReviewEditor(page: Page): Promise<number> {
 }
 
 async function expectBoundedCanvasSurfaces(page: Page): Promise<void> {
-  await expect(page.locator("canvas")).toHaveCount(2);
+  await expect(page.locator("canvas")).toHaveCount(3);
+  await expect(page.locator('[data-testid^="git-diff-sticky-header-"]')).toHaveCount(2);
   await expect(page.locator('[data-testid^="diff-code-row-"]')).toHaveCount(0);
   const elementCount = await page
     .getByTestId("git-diff-canvas-root")
@@ -527,40 +712,57 @@ async function benchmarkManyFileHeaderScrolling(page: Page): Promise<{
   p95FrameMs: number;
   maximumFrameMs: number;
   maximumShells: number;
+  maximumStickyCanvases: number;
   blankHeaderFrames: number;
   endScrollTop: number;
   maximumScrollTop: number;
 }> {
   return page.getByTestId("git-diff-scroll").evaluate(async (element) => {
     const scroll = element as HTMLElement;
-    const canvas = document.querySelector<HTMLCanvasElement>(
-      '[data-testid="git-diff-header-canvas"]',
-    );
     const maximumScrollTop = scroll.scrollHeight - scroll.clientHeight;
     const frameDurations: number[] = [];
     let maximumShells = 0;
+    let maximumStickyCanvases = 0;
     let blankHeaderFrames = 0;
     const sampleHeader = () => {
       maximumShells = Math.max(
         maximumShells,
         document.querySelectorAll('[data-diff-header="true"]').length,
       );
+      const canvases = Array.from(
+        document.querySelectorAll<HTMLCanvasElement>('[data-testid^="git-diff-sticky-header-"]'),
+      );
+      maximumStickyCanvases = Math.max(maximumStickyCanvases, canvases.length);
+      const scrollBounds = scroll.getBoundingClientRect();
+      const sampleX = scrollBounds.left + 4;
+      const sampleY = scrollBounds.top + 10;
+      const canvas = canvases.find((candidate) => {
+        const bounds = candidate.getBoundingClientRect();
+        return (
+          bounds.width > 0 &&
+          sampleX >= bounds.left &&
+          sampleX < bounds.right &&
+          sampleY >= bounds.top &&
+          sampleY < bounds.bottom
+        );
+      });
       if (canvas) {
         const context = canvas.getContext("2d")!;
-        const ratio = canvas.width / canvas.getBoundingClientRect().width;
+        const bounds = canvas.getBoundingClientRect();
+        const ratio = canvas.width / bounds.width;
         if (
-          context.getImageData(Math.round(4 * ratio), Math.round(10 * ratio), 1, 1).data[3] === 0
+          context.getImageData(
+            Math.round((sampleX - bounds.left) * ratio),
+            Math.round((sampleY - bounds.top) * ratio),
+            1,
+            1,
+          ).data[3] === 0
         ) {
           blankHeaderFrames += 1;
         }
         return;
       }
-      const bounds = scroll.getBoundingClientRect();
-      if (
-        !document.elementFromPoint(bounds.left + 4, bounds.top + 10)?.closest("[data-diff-header]")
-      ) {
-        blankHeaderFrames += 1;
-      }
+      blankHeaderFrames += 1;
     };
 
     for (const progress of [0, 0.25, 0.5, 0.75, 1]) {
@@ -601,6 +803,7 @@ async function benchmarkManyFileHeaderScrolling(page: Page): Promise<{
       p95FrameMs: percentile(0.95),
       maximumFrameMs: Math.max(...frameDurations),
       maximumShells,
+      maximumStickyCanvases,
       blankHeaderFrames,
       endScrollTop: scroll.scrollTop,
       maximumScrollTop,

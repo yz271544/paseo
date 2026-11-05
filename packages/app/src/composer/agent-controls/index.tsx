@@ -55,11 +55,14 @@ import type {
 import type { AgentProviderDefinition } from "@getpaseo/protocol/provider-manifest";
 import {
   getFeatureHighlightColor,
+  isFeatureActive,
   getFeatureTooltip,
   getAgentControlHintKey,
   resolveAgentModelSelection,
 } from "@/composer/agent-controls/utils";
 import { useIsCompactFormFactor } from "@/constants/layout";
+import { controlSizingForLayout, TOOLBAR_CONTROL_HEIGHT } from "@/components/ui/control-geometry";
+import { DensityIcon } from "@/components/ui/density-icon";
 import { readMeasuredWidth } from "@/hooks/use-container-width";
 import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
@@ -69,11 +72,10 @@ import {
   type AgentControlCommandCenterSource,
 } from "@/command-center/agent-control-registration";
 import { useComposerKeyboardScope } from "@/composer/keyboard-scope";
-import { isNative } from "@/constants/platform";
 import {
+  composerToolbarGeometry,
   resolveComposerControlDensity,
   resolveComposerControlPresentation,
-  resolveComposerToolbarGlyphSize,
   type ComposerControlDensity,
   type ComposerControlPresentation,
 } from "@/composer/agent-controls/layout";
@@ -211,8 +213,7 @@ function getModeProviderDefinitions(modeControl: AgentModeControlValue | null) {
 }
 
 function getFeatureIconColor(
-  featureId: string,
-  enabled: boolean,
+  feature: AgentFeature,
   palette: {
     blue: { 400: string };
     green: { 400: string };
@@ -220,11 +221,11 @@ function getFeatureIconColor(
   },
   foregroundMuted: string,
 ): string {
-  if (!enabled) {
+  if (!isFeatureActive(feature)) {
     return foregroundMuted;
   }
 
-  switch (getFeatureHighlightColor(featureId)) {
+  switch (getFeatureHighlightColor(feature.id)) {
     case "blue":
       return palette.blue[400];
     case "green":
@@ -394,6 +395,7 @@ type AgentControlsSlice = {
   runtimeModelId: string | null;
   model: string | null | undefined;
   features: AgentFeature[] | undefined;
+  runtimeThinkingOptionId: string | null;
   thinkingOptionId: string | null | undefined;
   lastUsage: unknown;
 } | null;
@@ -413,6 +415,7 @@ function selectAgentControlsSlice(
     runtimeModelId: currentAgent.runtimeInfo?.model ?? null,
     model: currentAgent.model,
     features: currentAgent.features,
+    runtimeThinkingOptionId: currentAgent.runtimeInfo?.thinkingOptionId ?? null,
     thinkingOptionId: currentAgent.thinkingOptionId,
     lastUsage: currentAgent.lastUsage,
   };
@@ -458,6 +461,10 @@ function buildAgentProviderModels(
   return map;
 }
 
+function densityFolds(density: ComposerControlDensity): boolean {
+  return resolveComposerControlPresentation(density).foldControls;
+}
+
 function buildOpenChangeHandler(
   selector: AgentControlSelector,
   setOpenSelector: (next: AgentControlSelector | null) => void,
@@ -501,14 +508,20 @@ function ControlledAgentControls({
   modelSelectorServerId = null,
   isCompactLayout,
 }: ControlledAgentControlsProps) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const isCompactFormFactor = useIsCompactFormFactor();
   const isCompact = isCompactLayout ?? isCompactFormFactor;
+  // Control sizes follow the window layout, as the toolbar's stylesheet does. A narrow pane in a
+  // wide window (`isCompactLayout`) changes which labels show, never how large a control is.
+  const toolbarSizing = controlSizingForLayout(isCompactFormFactor);
+  const toolbarGeometry = useMemo(() => composerToolbarGeometry(toolbarSizing), [toolbarSizing]);
   const { fontScale } = useWindowDimensions();
   const [activeSheet, setActiveSheet] = useState<ActiveSheet>(null);
   const [openSelector, setOpenSelector] = useState<AgentControlSelector | null>(null);
-  const initialDensity: ComposerControlDensity = isCompact ? "tight" : "full";
+  // A compact composer always folds its controls into the model sheet; the width budget only
+  // decides whether the model keeps its label.
+  const minimumDensity: ComposerControlDensity = isCompact ? "compact" : "full";
+  const initialDensity = minimumDensity;
   const [density, setDensity] = useState<ComposerControlDensity>(initialDensity);
   const densityRef = useRef<ComposerControlDensity>(initialDensity);
   const availableWidthRef = useRef(0);
@@ -572,10 +585,10 @@ function ControlledAgentControls({
   const presentation = useMemo(() => resolveComposerControlPresentation(density), [density]);
   const layoutContextValue = useMemo(
     () => ({
-      glyphSize: resolveComposerToolbarGlyphSize(isNative ? "native" : "web"),
+      glyphSize: toolbarGeometry.glyphSize,
       presentation,
     }),
-    [presentation],
+    [presentation, toolbarGeometry],
   );
 
   const updateDensityForWidth = useCallback(
@@ -584,12 +597,20 @@ function ControlledAgentControls({
         availableWidth,
         currentDensity: densityRef.current,
         controls: controlPresence,
+        geometry: toolbarGeometry,
+        minimumDensity,
       });
       if (nextDensity === densityRef.current) return;
+      // Folding swaps the toolbar controls for the model sheet and back, so whatever menu or
+      // sheet was open belonged to controls that are gone.
+      if (densityFolds(nextDensity) !== densityFolds(densityRef.current)) {
+        setOpenSelector(null);
+        setActiveSheet(null);
+      }
       densityRef.current = nextDensity;
       setDensity(nextDensity);
     },
-    [controlPresence],
+    [controlPresence, minimumDensity, toolbarGeometry],
   );
 
   const handleLayout = useCallback(
@@ -631,10 +652,9 @@ function ControlledAgentControls({
         selected={args.selected}
         active={args.active}
         onPress={args.onPress}
-        iconColor={theme.colors.foreground}
       />
     ),
-    [theme.colors.foreground],
+    [],
   );
 
   const handleOpenChange = useCallback(
@@ -700,8 +720,8 @@ function ControlledAgentControls({
 
   const handleCloseSheet = useCallback(() => {
     setActiveSheet(null);
-    if (!isCompact) onDropdownClose?.();
-  }, [isCompact, onDropdownClose]);
+    if (!presentation.foldControls) onDropdownClose?.();
+  }, [onDropdownClose, presentation.foldControls]);
 
   const handleSelectThinkingAndClose = useCallback(
     (thinkingOptionId: string) => {
@@ -732,7 +752,7 @@ function ControlledAgentControls({
   return (
     <ComposerControlLayoutProvider value={layoutContextValue}>
       <View style={styles.container} onLayout={handleLayout}>
-        {!isCompact ? (
+        {!presentation.foldControls ? (
           <DesktopAgentControlsContent
             provider={provider}
             providerOptions={providerOptions}
@@ -819,6 +839,7 @@ function ControlledAgentControls({
             renderThinkingOption={renderThinkingOption}
             modeControl={modeControl}
             glyphSize={layoutContextValue.glyphSize}
+            showLabels={presentation.showModelLabel}
             modelSelectorServerId={modelSelectorServerId}
             canSwitchProvider={Boolean(onSelectProviderAndModel)}
           />
@@ -1142,6 +1163,7 @@ interface SheetAgentControlsContentProps {
   }) => ReactElement;
   modeControl?: AgentModeControlValue | null;
   glyphSize: number;
+  showLabels: boolean;
   modelSelectorServerId: string | null;
   canSwitchProvider: boolean;
 }
@@ -1181,6 +1203,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
     renderThinkingOption,
     modeControl,
     glyphSize,
+    showLabels,
     modelSelectorServerId,
     canSwitchProvider,
   } = props;
@@ -1269,6 +1292,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
       isRetryingProvider={isRetryingModelProvider}
       serverId={modelSelectorServerId}
       glyphSize={glyphSize}
+      showLabels={showLabels}
       canSwitchProvider={canSwitchProvider}
     >
       {sheetControls}
@@ -1333,8 +1357,7 @@ function DesktopFeatureItem({
           <AgentControlTrigger
             icon={FeatureIcon}
             iconColor={getFeatureIconColor(
-              feature.id,
-              feature.value,
+              feature,
               theme.colors.palette,
               theme.colors.foregroundMuted,
             )}
@@ -1357,6 +1380,10 @@ function DesktopFeatureItem({
   if (feature.type === "select") {
     const FeatureIcon = getAgentFeatureIcon(feature.icon);
     const selectedOption = feature.options.find((o) => o.id === feature.value);
+    const iconOnly = feature.desktopTrigger === "icon";
+    const tooltip = iconOnly
+      ? `${feature.label}: ${selectedOption?.label ?? feature.label}`
+      : getFeatureTooltip(feature);
     return (
       <>
         <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
@@ -1364,18 +1391,24 @@ function DesktopFeatureItem({
             <AgentControlTrigger
               ref={featureAnchorRef}
               icon={FeatureIcon}
+              iconColor={getFeatureIconColor(
+                feature,
+                theme.colors.palette,
+                theme.colors.foregroundMuted,
+              )}
               surface="toolbar"
               label={feature.label}
               value={selectedOption?.label ?? feature.label}
+              showToolbarLabel={!iconOnly}
               open={openSelector === featureSelector}
               disabled={disabled}
               onPress={handleSelectPress}
-              accessibilityLabel={getFeatureTooltip(feature)}
+              accessibilityLabel={tooltip}
               testID={`agent-feature-${feature.id}`}
             />
           </TooltipTrigger>
           <TooltipContent side="top" align="center" offset={8}>
-            <Text style={styles.tooltipText}>{getFeatureTooltip(feature)}</Text>
+            <Text style={styles.tooltipText}>{tooltip}</Text>
           </TooltipContent>
         </Tooltip>
         <Combobox
@@ -1446,8 +1479,7 @@ function SheetFeatureItem({
           ref={featureAnchorRef}
           icon={FeatureIcon}
           iconColor={getFeatureIconColor(
-            feature.id,
-            feature.value,
+            feature,
             theme.colors.palette,
             theme.colors.foregroundMuted,
           )}
@@ -1483,6 +1515,11 @@ function SheetFeatureItem({
         <AgentControlTrigger
           ref={featureAnchorRef}
           icon={FeatureIcon}
+          iconColor={getFeatureIconColor(
+            feature,
+            theme.colors.palette,
+            theme.colors.foregroundMuted,
+          )}
           surface="sheet"
           label={feature.label}
           value={selectedOption?.label ?? feature.label}
@@ -1514,15 +1551,16 @@ function ThinkingComboboxOption({
   selected,
   active,
   onPress,
-  iconColor,
 }: {
   option: ComboboxOption;
   selected: boolean;
   active: boolean;
   onPress: () => void;
-  iconColor: string;
 }) {
-  const leadingSlot = useMemo(() => <ThinkingIcon size={16} color={iconColor} />, [iconColor]);
+  const leadingSlot = useMemo(
+    () => <DensityIcon icon={ThinkingIcon} size="md" color="foreground" />,
+    [],
+  );
   return (
     <ComboboxItem
       label={option.label}
@@ -1589,6 +1627,7 @@ export const AgentControls = memo(function AgentControls({
     models,
     runtimeModelId: agent?.runtimeModelId,
     configuredModelId: agent?.model,
+    runtimeThinkingOptionId: agent?.runtimeThinkingOptionId,
     explicitThinkingOptionId: agent?.thinkingOptionId,
   });
 
@@ -1788,7 +1827,7 @@ export const AgentControls = memo(function AgentControls({
         onEditAgentProfiles={handleEditAgentProfiles}
         onCreateAgentProfile={profileActions.create}
         onEditAgentProfile={profileActions.edit}
-        thinkingOptions={thinkingOptions.length > 1 ? thinkingOptions : undefined}
+        thinkingOptions={thinkingOptions.length > 0 ? thinkingOptions : undefined}
         selectedThinkingOptionId={modelSelection.selectedThinkingId ?? undefined}
         onSelectThinkingOption={handleSelectThinkingOption}
         features={agent.features}
@@ -1937,7 +1976,7 @@ const styles = StyleSheet.create((theme) => ({
     overflow: "hidden",
   },
   modeBadge: {
-    height: 28,
+    height: TOOLBAR_CONTROL_HEIGHT,
     flexDirection: "row",
     alignItems: "center",
     backgroundColor: "transparent",
@@ -1955,8 +1994,8 @@ const styles = StyleSheet.create((theme) => ({
     flexShrink: 0,
   },
   modeIconBadge: {
-    width: 28,
-    height: 28,
+    width: TOOLBAR_CONTROL_HEIGHT,
+    height: TOOLBAR_CONTROL_HEIGHT,
     alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: 0,

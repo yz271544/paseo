@@ -3,6 +3,12 @@ import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 import type { QueryClient } from "@tanstack/react-query";
 import type { DesktopSettings } from "@/desktop/settings/desktop-settings";
 import type { AppLanguage } from "@/i18n/locales";
+import type { SidebarNavPreference } from "@/sidebar-nav/model";
+import {
+  DEFAULT_USAGE_PREFERENCES,
+  UsagePreferencesSchema,
+  type UsagePreferences,
+} from "@/usage/preferences";
 import {
   DEFAULT_SIDEBAR_CHECKS_DISPLAY,
   type SidebarChecksDisplay,
@@ -14,6 +20,7 @@ import {
 } from "@/components/sidebar/display-preferences/row-items";
 import { isNative } from "@/constants/platform";
 import {
+  DEFAULT_CONTENT_MAX_WIDTH,
   FONT_SIZE,
   PLUGIN_THEME_PREFERENCE,
   THEME_OPTIONS,
@@ -26,6 +33,8 @@ import { migrateAppSettings } from "./migrations";
 export { APP_SETTINGS_KEY } from "./keys";
 export const APP_SETTINGS_QUERY_KEY = ["app-settings"];
 
+export type SendShortcut = "enter" | "mod-enter";
+
 export type SendBehavior = ActiveTurnBehavior | "queue";
 export type ReleaseChannel = "stable" | "beta";
 export type ServiceUrlBehavior = "ask" | "in-app" | "external";
@@ -33,7 +42,8 @@ export type WorkspaceTitleSource = "title" | "branch";
 export type PullRequestOpenLocation = "main" | "side" | "explorer";
 /** What a sidebar workspace row shows in the space to the right of its title. */
 export type SidebarWorkspaceTrailing = "diff" | "timestamp" | "none";
-export type ToolCallDetailLevel = "overview" | "detailed";
+/** How much of an agent's work the chat shows between the user's message and the reply. */
+export type ChatDisplay = "full" | "collapseToolCalls" | "collapseTurns";
 
 const ThemePreferenceSchema = z.enum([
   ...THEME_OPTIONS.map((option) => option.name),
@@ -62,6 +72,9 @@ export const DEFAULT_CODE_FONT_SIZE = 12; // == FONT_SIZE.code
 export const MIN_CODE_FONT_SIZE = 9;
 export const MAX_CODE_FONT_SIZE = 22; // line-height 1.5×22=33 stays safe
 export const MAX_FONT_FAMILY_LENGTH = 200;
+export { DEFAULT_CONTENT_MAX_WIDTH };
+export const MIN_CONTENT_MAX_WIDTH = 600;
+export const MAX_CONTENT_MAX_WIDTH = 4000;
 
 export interface AppSettings {
   theme: ThemePreference;
@@ -71,25 +84,38 @@ export interface AppSettings {
   sendBehavior: SendBehavior;
   serviceUrlBehavior: ServiceUrlBehavior;
   terminalScrollbackLines: number;
-  useLegacyTerminalRenderer: boolean;
   uiFontFamily: string; // "" = platform default UI stack
   monoFontFamily: string; // "" = platform default mono stack
   uiBaseFontSize: number; // clamped px, platform default 14 or 15
   contentFontSize: number; // clamped px, platform default 15 or 16
   codeFontSize: number; // clamped px, default 12
+  /** Max width of chat and markdown content in px; null follows the current default. */
+  contentMaxWidth: number | null;
   syntaxTheme: SyntaxThemeId; // default "one"
   workspaceTitleSource: WorkspaceTitleSource;
   sidebarWorkspaceTrailing: SidebarWorkspaceTrailing;
   sidebarRowItems: SidebarRowItems;
   sidebarChecksDisplay: SidebarChecksDisplay;
+  /** Top-level sidebar rows in display order; empty means the default order, all visible. */
+  sidebarNavItems: SidebarNavPreference[];
+  /** Sidebar footer items in display order; empty means the default order, all visible. */
+  sidebarFooterItems: SidebarNavPreference[];
+  /** How usage reads and which windows the sidebar summary shows. */
+  usage: UsagePreferences;
   autoExpandReasoning: boolean;
-  toolCallDetailLevel: ToolCallDetailLevel;
+  chatDisplay: ChatDisplay;
   chatOutlineEnabled: boolean;
   vimKeybindings: boolean;
+  sendShortcut: SendShortcut;
+  filePanelAssociations: Record<string, string>;
   /** Desktop-only preferences for implicit opens into the ordinary side pane. */
   openInSidePane: OpenInSidePanePreferences;
   pullRequestOpenLocation: PullRequestOpenLocation;
 }
+
+export type AppSettingsUpdate =
+  | Partial<AppSettings>
+  | ((current: AppSettings) => Partial<AppSettings>);
 
 export interface OpenInSidePanePreferences {
   explorerFiles: boolean;
@@ -119,21 +145,26 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   sendBehavior: "steer",
   serviceUrlBehavior: "ask",
   terminalScrollbackLines: DEFAULT_TERMINAL_SCROLLBACK_LINES,
-  useLegacyTerminalRenderer: false,
   uiFontFamily: "",
   monoFontFamily: "",
   uiBaseFontSize: DEFAULT_UI_BASE_FONT_SIZE,
   contentFontSize: DEFAULT_CONTENT_FONT_SIZE,
   codeFontSize: DEFAULT_CODE_FONT_SIZE,
+  contentMaxWidth: null,
   syntaxTheme: "one",
   workspaceTitleSource: "title",
-  sidebarWorkspaceTrailing: "diff",
+  sidebarWorkspaceTrailing: "timestamp",
   sidebarRowItems: DEFAULT_SIDEBAR_ROW_ITEMS,
   sidebarChecksDisplay: DEFAULT_SIDEBAR_CHECKS_DISPLAY,
+  sidebarNavItems: [],
+  sidebarFooterItems: [],
+  usage: DEFAULT_USAGE_PREFERENCES,
   autoExpandReasoning: false,
-  toolCallDetailLevel: "detailed",
+  chatDisplay: "collapseTurns",
   chatOutlineEnabled: true,
   vimKeybindings: false,
+  sendShortcut: "enter",
+  filePanelAssociations: {},
   openInSidePane: DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES,
   pullRequestOpenLocation: "explorer",
 };
@@ -173,6 +204,7 @@ const SidebarRowItemsSchema = z
 type StoredAppSettingsFallback = AppSettings & {
   uiFontSize?: number;
   compactToolCalls?: boolean;
+  toolCallDetailLevel?: "overview" | "detailed";
   manageBuiltInDaemon?: boolean;
   releaseChannel?: ReleaseChannel;
   needsWrite: boolean;
@@ -196,7 +228,6 @@ const StoredAppSettingsSchema = z
       MIN_TERMINAL_SCROLLBACK_LINES,
       MAX_TERMINAL_SCROLLBACK_LINES,
     ).catch(DEFAULT_TERMINAL_SCROLLBACK_LINES),
-    useLegacyTerminalRenderer: z.boolean().catch(false),
     uiFontFamily: sanitizedFontFamily().catch(""),
     monoFontFamily: sanitizedFontFamily().catch(""),
     uiBaseFontSize: clampedNumber(MIN_UI_BASE_FONT_SIZE, MAX_UI_BASE_FONT_SIZE)
@@ -210,24 +241,35 @@ const StoredAppSettingsSchema = z
     codeFontSize: clampedNumber(MIN_CODE_FONT_SIZE, MAX_CODE_FONT_SIZE).catch(
       DEFAULT_CODE_FONT_SIZE,
     ),
+    contentMaxWidth: z
+      .null()
+      .or(clampedNumber(MIN_CONTENT_MAX_WIDTH, MAX_CONTENT_MAX_WIDTH))
+      .catch(null),
     syntaxTheme: z.string().refine(isSyntaxThemeId).catch("one"),
     workspaceTitleSource: z.enum(["title", "branch"]).catch("title"),
-    sidebarWorkspaceTrailing: z.enum(["diff", "timestamp", "none"]).catch("diff"),
+    sidebarWorkspaceTrailing: z.enum(["diff", "timestamp", "none"]).catch("timestamp"),
     sidebarRowItems: SidebarRowItemsSchema,
     sidebarChecksDisplay: z
       .enum(["iconAndText", "icon", "none"])
       .optional()
       .catch(DEFAULT_SIDEBAR_CHECKS_DISPLAY),
+    sidebarNavItems: z.array(z.object({ key: z.string(), visible: z.boolean() })).catch([]),
+    sidebarFooterItems: z.array(z.object({ key: z.string(), visible: z.boolean() })).catch([]),
+    usage: UsagePreferencesSchema,
     autoExpandReasoning: z.boolean().catch(false),
+    chatDisplay: z.enum(["full", "collapseToolCalls", "collapseTurns"]).optional().catch("full"),
+    // COMPAT(toolCallDetailLevel): replaced by chatDisplay in v0.13, remove after 2027-04-24.
     toolCallDetailLevel: z
       .enum(["overview", "detailed"])
       .or(z.literal("concise").transform(() => "overview" as const))
       .optional()
-      .catch("detailed"),
+      .catch(undefined),
     // COMPAT(compactToolCalls): migrated in v0.1.105, remove after 2027-01-12.
     compactToolCalls: z.boolean().optional().catch(undefined),
     chatOutlineEnabled: z.boolean().catch(true),
     vimKeybindings: z.boolean().catch(false),
+    sendShortcut: z.enum(["enter", "mod-enter"]).catch("enter"),
+    filePanelAssociations: z.record(z.string(), z.string()).catch({}),
     openInSidePane: z
       .object({
         explorerFiles: z.boolean().catch(false),
@@ -272,8 +314,10 @@ const StoredAppSettingsSchema = z
       (isChecksHiddenByLegacyRowItem(stored.sidebarRowItems)
         ? "none"
         : DEFAULT_SIDEBAR_CHECKS_DISPLAY);
-    const toolCallDetailLevel =
-      stored.toolCallDetailLevel ?? (stored.compactToolCalls ? "overview" : "detailed");
+    const groupsToolCalls = stored.toolCallDetailLevel
+      ? stored.toolCallDetailLevel === "overview"
+      : stored.compactToolCalls === true;
+    const chatDisplay = stored.chatDisplay ?? (groupsToolCalls ? "collapseToolCalls" : "full");
     return {
       ...stored,
       openInSidePane,
@@ -288,7 +332,7 @@ const StoredAppSettingsSchema = z
           stored.sidebarRowItems.services ??
           (stored.sidebarRowItems.scripts === false ? false : DEFAULT_SIDEBAR_ROW_ITEMS.services),
       },
-      toolCallDetailLevel,
+      chatDisplay,
       needsWrite,
     };
   })
@@ -319,14 +363,15 @@ export interface SettingsDeps {
 
 export async function saveAppSettings(input: {
   queryClient: QueryClient;
-  updates: Partial<AppSettings>;
+  updates: AppSettingsUpdate;
   deps: SettingsDeps;
 }): Promise<void> {
   const storedCurrent =
     input.queryClient.getQueryData<AppSettings>(APP_SETTINGS_QUERY_KEY) ??
     (await loadAppSettingsFromStorage(input.deps));
   const current = normalizeAppSettings(storedCurrent);
-  const next = { ...current, ...input.updates };
+  const updates = typeof input.updates === "function" ? input.updates(current) : input.updates;
+  const next = { ...current, ...updates };
   input.queryClient.setQueryData<AppSettings>(APP_SETTINGS_QUERY_KEY, next);
   await writeAppSettings(
     input.deps.storage,
@@ -415,6 +460,7 @@ export function normalizeAppSettings(value: unknown): AppSettings {
     manageBuiltInDaemon: _manageBuiltInDaemon,
     releaseChannel: _releaseChannel,
     compactToolCalls: _compactToolCalls,
+    toolCallDetailLevel: _toolCallDetailLevel,
     uiFontSize: _uiFontSize,
     ...settings
   } = StoredAppSettingsSchema.parse(value);
@@ -445,6 +491,14 @@ export function parseTerminalScrollbackLines(value: unknown): number | null {
     MAX_TERMINAL_SCROLLBACK_LINES,
     Math.max(MIN_TERMINAL_SCROLLBACK_LINES, Math.floor(numericValue)),
   );
+}
+
+export function parseContentMaxWidth(value: unknown): number | null {
+  return parseClampedFontSize(value, { min: MIN_CONTENT_MAX_WIDTH, max: MAX_CONTENT_MAX_WIDTH });
+}
+
+export function resolveContentMaxWidth(settings: Pick<AppSettings, "contentMaxWidth">): number {
+  return settings.contentMaxWidth ?? DEFAULT_CONTENT_MAX_WIDTH;
 }
 
 export function parseClampedFontSize(
@@ -480,7 +534,24 @@ export function sanitizeFontFamily(value: unknown): string | null {
   if ([...trimmed].some((char) => char.charCodeAt(0) <= 0x1f)) {
     return null; // control chars would corrupt the font-family string
   }
-  return trimmed; // quotes/commas are legit in stacks
+  // Unistyles serializes theme values into one shared stylesheet. An unfinished
+  // string, escape, comment, or block consumes the declarations that follow.
+  let quote: string | null = null;
+  let escaped = false;
+  for (const char of trimmed) {
+    if (escaped) {
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (quote !== null) {
+      if (char === quote) quote = null;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (/[()[\]/*]/.test(char)) {
+      return null;
+    }
+  }
+  return quote === null && !escaped ? trimmed : null;
 }
 
 async function loadLegacyDesktopSettingsFromStorage(storage: KeyValueStorage): Promise<{

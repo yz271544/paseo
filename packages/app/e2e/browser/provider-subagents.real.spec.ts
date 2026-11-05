@@ -9,6 +9,11 @@ import {
   type AgentHandle,
   type RewindFlowProvider,
 } from "../support/helpers/rewind-flow";
+import {
+  expectNestedProviderSubagentOwnership,
+  launchNestedProviderSubagentOwnershipScenario,
+  reopenNestedProviderSession,
+} from "../support/helpers/provider-subagents";
 import { openSubagentsTrack } from "../support/helpers/subagents";
 
 interface ProviderSubagentCase {
@@ -26,7 +31,7 @@ const cases: ProviderSubagentCase[] = [
     provider: "claude",
     sentinel: "CLAUDE_CHILD_SENTINEL",
     expectedName: "sentinel_child",
-    providerConfig: { model: "opus" },
+    providerConfig: { model: "claude-sonnet-5" },
     prompt:
       'Use Claude Code\'s native Task tool exactly once. Set its subagent_type input to "Explore" and its name input to "sentinel_child". Ask it to reply with exactly CLAUDE_CHILD_SENTINEL and do nothing else. Wait for it, then reply ROOT_DONE. Do not use Paseo tools.',
   },
@@ -131,7 +136,8 @@ test.describe("real provider subagent timelines", () => {
           panel.getByText("Start chatting with this agent...", { exact: true }),
         ).toHaveCount(0);
 
-        await page.getByTestId(`workspace-tab-agent_${handle.agentId}`).first().click();
+        // A provider subagent has no composer; its callout is the way back to the parent.
+        await page.getByTestId("parent-agent-callout-open").click();
         await expect(
           page.getByTestId("assistant-message").filter({ hasText: "ROOT_DONE" }).last(),
         ).toBeVisible({ timeout: 60_000 });
@@ -146,4 +152,24 @@ test.describe("real provider subagent timelines", () => {
       }
     });
   }
+});
+
+test.describe("real Claude nested subagent ownership", () => {
+  test.setTimeout(600_000);
+
+  test("keeps a grandchild and its background notification with their direct owners", async ({
+    page,
+  }, testInfo) => {
+    const cwd = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-claude-nested-ui-")));
+    let handle: AgentHandle | undefined;
+
+    try {
+      handle = await launchNestedProviderSubagentOwnershipScenario(page, cwd);
+      await expectNestedProviderSubagentOwnership(page, testInfo, "live");
+      await reopenNestedProviderSession(handle);
+      await expectNestedProviderSubagentOwnership(page, testInfo, "reopened");
+    } finally {
+      await cleanupRewindFlow({ handle, cwd });
+    }
+  });
 });
