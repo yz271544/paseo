@@ -191,6 +191,27 @@ See [SECURITY.md](../SECURITY.md) for the daemon trust model.
 
 ## Building Locally
 
+From the repository root, use the [Makefile](../Makefile) to build with
+`node:24.20.0-trixie` and tag
+`registry.cn-beijing.aliyuncs.com/dc_huzy/paseo-trixie` with the output of
+`git describe --tags --always`:
+
+```bash
+make                       # Build using Docker's layer cache
+make image                 # Print the full image name
+make -n build              # Preview the build command
+make build TAG=local       # Override the Git tag
+make build IMAGE=paseo NODE_IMAGE=node:24.20.0-trixie
+make build BUILD_ARGS="--no-cache --pull"
+make push                  # Build, then push (requires docker login)
+```
+
+`IMAGE`, `TAG`, `NODE_IMAGE`, `DOCKERFILE`, `DOCKER`, and `BUILD_ARGS` can be
+overridden on the command line. The Git tag names the image; it is not passed
+as `PASEO_VERSION`, which must match the version in `package.json`.
+
+To build directly with Docker:
+
 ```bash
 docker build -f docker/base/Dockerfile -t paseo:local .
 ```
